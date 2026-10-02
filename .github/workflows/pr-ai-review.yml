@@ -1,0 +1,130 @@
+name: AI PR Review
+
+# Automated review of a pull request by Claude on Amazon Bedrock. See
+# Tools/ci/ai_review/README.md for the pipeline and the trust model.
+#
+# Pilot stage: manual dispatch only. Results go to the job summary and to
+# artifacts; nothing is posted on the PR (pr-review-poster.yml only acts on
+# pull_request runs, and this workflow is not in its producer list yet).
+#
+# Credentials: the job assumes the px4-ai-review IAM role through GitHub
+# OIDC. That role's trust policy only accepts this file running from
+# refs/heads/main in PX4/PX4-Autopilot, and the role may only invoke the
+# Claude Opus 5.5 and Sonnet 5.5 global inference profiles. Renaming or
+# moving this file requires updating the trust policy.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: Pull request number to review
+        required: true
+        type: number
+      model:
+        description: Reviewer model
+        type: choice
+        options: [opus, sonnet]
+        default: opus
+      effort:
+        description: Reviewer effort
+        type: choice
+        options: [medium, high, xhigh, max]
+        default: xhigh
+
+permissions:
+  contents: read
+  pull-requests: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.pr_number }}
+  cancel-in-progress: true
+
+env:
+  CLAUDE_CODE_VERSION: 2.1.287
+  # Sandbox for code the model writes to check its math: px4-dev, pinned
+  SANDBOX_IMAGE: ghcr.io/px4/px4-dev:v1.18.0-beta2@sha256:8e61e75c975673e4ff6846c05f2e67a9c6658c596a4758f5d5fe6ea6c5b9062f
+
+jobs:
+  review:
+    name: Review PR #${{ inputs.pr_number }}
+    runs-on: [runs-on,runner=2cpu-linux-x64,image=ubuntu24-full-x64,"run-id=${{ github.run_id }}",spot=false]
+    timeout-minutes: 45
+    steps:
+      - uses: runs-on/action@v2
+
+      # Trusted code and prompts, from the branch this workflow runs on.
+      - name: Checkout review tooling
+        uses: actions/checkout@v6
+        with:
+          path: base
+          persist-credentials: false
+          sparse-checkout: |
+            AGENTS.md
+            .agents/skills/review-pr
+            .github/instructions
+            Tools/ci
+          sparse-checkout-cone-mode: false
+
+      # The PR itself, as data for the agent to read. Never built or run.
+      # Full history without blobs, so git log/blame work for the history
+      # check while fetching only the file contents actually read.
+      - name: Checkout PR head
+        uses: actions/checkout@v6
+        with:
+          path: pr
+          ref: refs/pull/${{ inputs.pr_number }}/head
+          persist-credentials: false
+          fetch-depth: 0
+          filter: blob:none
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - name: Install Claude Code
+        run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+
+      # Install gVisor as the sandbox runtime, block the EC2 metadata
+      # service so the runner's instance role is unreachable for the rest
+      # of the job, and prove the sandbox has no network. Fails closed.
+      - name: Harden runner
+        working-directory: base/Tools/ci
+        run: >-
+          python3 -m ai_review harden --checkout "$GITHUB_WORKSPACE/pr"
+          --sandbox-image "$SANDBOX_IMAGE" --sandbox-runtime runsc
+
+      - name: Configure AWS from OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::810743298831:role/px4-ai-review
+          aws-region: us-west-2
+
+      - name: Run review
+        working-directory: base/Tools/ci
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ inputs.pr_number }}
+          MODEL: ${{ inputs.model }}
+          EFFORT: ${{ inputs.effort }}
+        run: >-
+          python3 -m ai_review run --pr "$PR_NUMBER" --model "$MODEL"
+          --effort "$EFFORT" --trusted-root "$GITHUB_WORKSPACE/base"
+          --checkout "$GITHUB_WORKSPACE/pr"
+          --work-dir "$GITHUB_WORKSPACE/ai-review-work"
+          --out-dir "$GITHUB_WORKSPACE/pr-review"
+          --sandbox-image "$SANDBOX_IMAGE" --sandbox-runtime runsc
+
+      - name: Upload review report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ai-review-report
+          path: |
+            ai-review-work/findings.json
+            ai-review-work/report.md
+            ai-review-work/usage.json
+            pr-review/manifest.json
+            pr-review/comments.json
+          if-no-files-found: ignore
+          retention-days: 30
